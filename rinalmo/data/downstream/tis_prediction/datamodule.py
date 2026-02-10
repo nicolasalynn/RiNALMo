@@ -1,4 +1,4 @@
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 import pytorch_lightning as pl
 
@@ -22,6 +22,10 @@ class TISDataModule(pl.LightningDataModule):
 
     Each CSV must have columns ``sequence`` and ``tis_positions`` (see
     :class:`TISDataset` for format details).
+
+    Training uses a WeightedRandomSampler so that roughly half of each
+    batch contains windows with at least one TIS site, preventing the
+    model from collapsing to an all-negative prediction.
     """
 
     def __init__(
@@ -66,12 +70,20 @@ class TISDataModule(pl.LightningDataModule):
             )
 
     def train_dataloader(self):
+        # Balanced sampling: up-weight windows that contain TIS sites
+        weights = self.train_dataset.get_sample_weights()
+        sampler = WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(weights),
+            replacement=True,
+        )
+
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            shuffle=True,
+            sampler=sampler,  # replaces shuffle=True
             collate_fn=tis_collate_fn,
         )
 

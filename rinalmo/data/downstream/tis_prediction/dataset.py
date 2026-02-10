@@ -86,6 +86,7 @@ class TISDataset(Dataset):
         # Read CSV and pre-compute windows
         df = pd.read_csv(csv_path)
         self.samples: List[Tuple[str, List[int]]] = []  # (subseq, tis_positions_in_subseq)
+        self._has_tis: List[bool] = []  # per-sample flag for balanced sampling
         self._build_samples(df)
 
     # ------------------------------------------------------------------
@@ -116,6 +117,7 @@ class TISDataset(Dataset):
             # No windowing needed
             if self.max_seq_len is None or seq_len <= self.max_seq_len:
                 self.samples.append((seq, tis_positions))
+                self._has_tis.append(len(tis_positions) > 0)
                 continue
 
             # --- Windowing for long sequences ----------------------------------
@@ -153,6 +155,25 @@ class TISDataset(Dataset):
                     if w_start <= p < w_end
                 ]
                 self.samples.append((subseq, sub_tis))
+                self._has_tis.append(len(sub_tis) > 0)
+
+    # ------------------------------------------------------------------
+    # Sampling weights for balanced training
+    # ------------------------------------------------------------------
+    def get_sample_weights(self) -> List[float]:
+        """Return per-sample weights for WeightedRandomSampler.
+
+        Windows containing at least one TIS site are up-weighted so that
+        roughly half of each batch contains positive examples, despite
+        TIS-containing windows being a small minority of the dataset.
+        """
+        n_pos = sum(self._has_tis)
+        n_neg = len(self._has_tis) - n_pos
+        if n_pos == 0 or n_neg == 0:
+            return [1.0] * len(self._has_tis)
+        # Weight so that positive and negative windows are sampled equally
+        w_pos = n_neg / n_pos  # e.g. if 3% positive, w_pos ≈ 32
+        return [w_pos if h else 1.0 for h in self._has_tis]
 
     # ------------------------------------------------------------------
     # __getitem__

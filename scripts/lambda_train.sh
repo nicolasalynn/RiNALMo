@@ -5,6 +5,7 @@
 set -e
 
 cd ~/RiNALMo
+export PYTHONPATH=$HOME/RiNALMo:$PYTHONPATH
 
 python train_tis_prediction.py \
     --data_dir ./data/tis_prediction \
@@ -19,7 +20,7 @@ python train_tis_prediction.py \
     --pin_memory \
     --wandb \
     --wandb_project rinalmo-tis \
-    --wandb_experiment_name tis-giga-frozen-v1 \
+    --wandb_experiment_name tis-giga-frozen-balanced-v2 \
     --checkpoint_every_epoch \
     --gradient_clip_val 1.0 \
     --log_every_n_steps 50

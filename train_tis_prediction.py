@@ -292,12 +292,12 @@ if __name__ == "__main__":
 
     # --- Loss hyper-parameters --------------------------------------------
     parser.add_argument(
-        "--focal_gamma", type=float, default=2.0,
-        help="Focal loss gamma (focusing parameter)",
+        "--focal_gamma", type=float, default=0.5,
+        help="Focal loss gamma (focusing parameter; lower = less suppression of rare positives)",
     )
     parser.add_argument(
-        "--pos_weight", type=float, default=10.0,
-        help="Weight for positive (TIS) class to handle imbalance",
+        "--pos_weight", type=float, default=50.0,
+        help="Weight for positive (TIS) class to handle token-level imbalance",
     )
     parser.add_argument(
         "--non_atg_tis_bonus", type=float, default=5.0,

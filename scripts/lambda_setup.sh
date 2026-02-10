@@ -9,7 +9,7 @@ echo "=== Setting up RiNALMo TIS training ==="
 
 # 1. Clone repo and install
 cd ~
-git clone https://github.com/lbcb-sci/RiNALMo.git
+git clone -b non_flash https://github.com/nicolasalynn/RiNALMo.git
 cd RiNALMo
 
 pip install -e .
