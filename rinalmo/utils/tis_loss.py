@@ -2,39 +2,42 @@ import torch
 from torch import nn
 
 
-class TISAwareFocalLoss(nn.Module):
-    """Focal loss with ATG-aware sample weighting for TIS prediction.
+class CompoundTISLoss(nn.Module):
+    """Compound loss for TIS prediction: Tversky + ATG-contrastive BCE.
 
-    Addresses two key challenges:
-      1. Class imbalance — very few TIS positions vs. many non-TIS positions.
-      2. ATG bias — most annotated TIS are ATG/AUG, risking a trivial classifier
-         that simply flags every ATG. We counteract this by:
-         - Up-weighting non-ATG TIS sites (so the model must learn to find them).
-         - Up-weighting ATG non-TIS sites (so the model learns ATG != TIS).
+    Two complementary terms:
+
+    1. **Tversky loss** — a soft, differentiable generalisation of the Dice
+       coefficient that directly optimises TP / (TP + α·FP + β·FN).
+       Setting β > α biases toward recall, which is what we want: missing a
+       real TIS is worse than a false alarm.  Critically, Tversky loss is
+       *insensitive to true negatives*, so the sea of non-TIS positions
+       does not dominate the gradient.
+
+    2. **ATG-contrastive BCE** — binary cross-entropy computed *only* on
+       positions where an ATG codon begins.  This forces the model to
+       explicitly discriminate TIS-ATGs from non-TIS-ATGs rather than
+       learning the shortcut "ATG → positive".
 
     Args:
-        gamma: Focal-loss focusing parameter. Higher values down-weight easy
-            examples more aggressively (default 2.0).
-        pos_weight: Base weight for all positive (TIS) positions to compensate
-            for class imbalance.
-        non_atg_tis_bonus: Extra multiplier applied *on top of* pos_weight for
-            TIS positions that are NOT the start of an ATG codon.
-        atg_neg_weight: Weight for ATG positions that are NOT TIS — these are
-            the critical hard negatives the model must learn to reject.
+        tversky_alpha: Weight on false positives in Tversky denominator.
+        tversky_beta:  Weight on false negatives (β > α → recall bias).
+        atg_lambda:    Mixing coefficient for the ATG-contrastive term.
+        smooth:        Smoothing constant to avoid division by zero.
     """
 
     def __init__(
         self,
-        gamma: float = 2.0,
-        pos_weight: float = 10.0,
-        non_atg_tis_bonus: float = 5.0,
-        atg_neg_weight: float = 2.0,
+        tversky_alpha: float = 0.3,
+        tversky_beta: float = 0.7,
+        atg_lambda: float = 1.0,
+        smooth: float = 1.0,
     ):
         super().__init__()
-        self.gamma = gamma
-        self.pos_weight = pos_weight
-        self.non_atg_tis_bonus = non_atg_tis_bonus
-        self.atg_neg_weight = atg_neg_weight
+        self.alpha = tversky_alpha
+        self.beta = tversky_beta
+        self.atg_lambda = atg_lambda
+        self.smooth = smooth
 
     def forward(
         self,
@@ -45,49 +48,44 @@ class TISAwareFocalLoss(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            logits:      (B, L) raw logits per token position.
-            labels:      (B, L) binary labels (1 = TIS, 0 = not TIS).
-            atg_mask:    (B, L) bool — True where an ATG codon begins.
-            ignore_mask: (B, L) bool — True for positions to exclude from loss
-                         (CLS, EOS, PAD tokens).
+            logits:      (B, L) raw logits per position.
+            labels:      (B, L) binary targets.
+            atg_mask:    (B, L) bool — True where ATG codon begins.
+            ignore_mask: (B, L) bool — True for CLS / EOS / PAD.
 
         Returns:
-            Scalar loss averaged over valid positions.
+            Scalar loss.
         """
         probs = torch.sigmoid(logits)
 
-        # ---- focal modulation ------------------------------------------------
-        p_t = labels * probs + (1.0 - labels) * (1.0 - probs)
-        focal_weight = (1.0 - p_t) ** self.gamma
-
-        # ---- per-element BCE (numerically stable via log-sum-exp) ------------
-        # Using the identity: BCE = max(logits, 0) - logits*labels + log(1+exp(-|logits|))
-        bce = torch.nn.functional.binary_cross_entropy_with_logits(
-            logits, labels, reduction="none"
-        )
-
-        # ---- class-balance weights -------------------------------------------
-        class_weight = torch.where(labels == 1.0, self.pos_weight, 1.0)
-
-        # ---- ATG-aware weights -----------------------------------------------
-        atg_aware_weight = torch.ones_like(labels)
-        # Non-ATG TIS: rare and critical to detect
-        atg_aware_weight = torch.where(
-            (labels == 1.0) & (~atg_mask), self.non_atg_tis_bonus, atg_aware_weight
-        )
-        # ATG non-TIS: hard negatives — model must learn to reject these
-        atg_aware_weight = torch.where(
-            (labels == 0.0) & atg_mask, self.atg_neg_weight, atg_aware_weight
-        )
-
-        # ---- combine ---------------------------------------------------------
-        loss = focal_weight * class_weight * atg_aware_weight * bce
-
-        # ---- mask out ignored positions (CLS, EOS, PAD) ----------------------
+        # Build valid mask
         if ignore_mask is not None:
-            loss = loss.masked_fill(ignore_mask, 0.0)
-            n_valid = (~ignore_mask).sum().clamp(min=1)
+            valid = ~ignore_mask
         else:
-            n_valid = loss.numel()
+            valid = torch.ones_like(labels, dtype=torch.bool)
 
-        return loss.sum() / n_valid
+        # ---- Tversky loss (on all valid positions) -----------------------
+        p = probs[valid]
+        t = labels[valid]
+
+        tp = (p * t).sum()
+        fp = (p * (1.0 - t)).sum()
+        fn = ((1.0 - p) * t).sum()
+
+        tversky_index = (tp + self.smooth) / (
+            tp + self.alpha * fp + self.beta * fn + self.smooth
+        )
+        tversky_loss = 1.0 - tversky_index
+
+        # ---- ATG-contrastive BCE (only on ATG positions) -----------------
+        atg_valid = valid & atg_mask
+        if atg_valid.any():
+            atg_logits = logits[atg_valid]
+            atg_labels = labels[atg_valid]
+            atg_bce = nn.functional.binary_cross_entropy_with_logits(
+                atg_logits, atg_labels, reduction="mean"
+            )
+        else:
+            atg_bce = torch.tensor(0.0, device=logits.device)
+
+        return tversky_loss + self.atg_lambda * atg_bce

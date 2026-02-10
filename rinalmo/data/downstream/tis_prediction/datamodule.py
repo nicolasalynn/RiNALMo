@@ -1,4 +1,4 @@
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader
 
 import pytorch_lightning as pl
 
@@ -6,7 +6,11 @@ from typing import Union, Optional
 from pathlib import Path
 
 from rinalmo.data.alphabet import Alphabet
-from rinalmo.data.downstream.tis_prediction.dataset import TISDataset, tis_collate_fn
+from rinalmo.data.downstream.tis_prediction.dataset import (
+    TISDataset,
+    StructuredTISBatchSampler,
+    tis_collate_fn,
+)
 
 
 class TISDataModule(pl.LightningDataModule):
@@ -23,9 +27,9 @@ class TISDataModule(pl.LightningDataModule):
     Each CSV must have columns ``sequence`` and ``tis_positions`` (see
     :class:`TISDataset` for format details).
 
-    Training uses a WeightedRandomSampler so that roughly half of each
-    batch contains windows with at least one TIS site, preventing the
-    model from collapsing to an all-negative prediction.
+    Training uses :class:`StructuredTISBatchSampler` to construct each
+    batch with a controlled mix of positive windows, hard negatives
+    (ATG-containing, no TIS), and easy negatives.
     """
 
     def __init__(
@@ -37,6 +41,8 @@ class TISDataModule(pl.LightningDataModule):
         batch_size: int = 1,
         num_workers: int = 0,
         pin_memory: bool = False,
+        pos_frac: float = 0.5,
+        hard_frac: float = 0.3,
     ):
         super().__init__()
 
@@ -48,6 +54,8 @@ class TISDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
+        self.pos_frac = pos_frac
+        self.hard_frac = hard_frac
 
     def setup(self, stage: Optional[str] = None):
         if self.data_root is not None:
@@ -70,20 +78,18 @@ class TISDataModule(pl.LightningDataModule):
             )
 
     def train_dataloader(self):
-        # Balanced sampling: up-weight windows that contain TIS sites
-        weights = self.train_dataset.get_sample_weights()
-        sampler = WeightedRandomSampler(
-            weights=weights,
-            num_samples=len(weights),
-            replacement=True,
+        sampler = StructuredTISBatchSampler(
+            dataset=self.train_dataset,
+            batch_size=self.batch_size,
+            pos_frac=self.pos_frac,
+            hard_frac=self.hard_frac,
         )
 
         return DataLoader(
             self.train_dataset,
-            batch_size=self.batch_size,
+            batch_sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
-            sampler=sampler,  # replaces shuffle=True
             collate_fn=tis_collate_fn,
         )
 

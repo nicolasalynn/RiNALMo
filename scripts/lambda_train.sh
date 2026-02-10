@@ -18,9 +18,14 @@ python train_tis_prediction.py \
     --seed 42 \
     --num_workers 4 \
     --pin_memory \
+    --tversky_alpha 0.3 \
+    --tversky_beta 0.7 \
+    --atg_lambda 1.0 \
+    --pos_frac 0.5 \
+    --hard_frac 0.3 \
     --wandb \
     --wandb_project rinalmo-tis \
-    --wandb_experiment_name tis-giga-frozen-balanced-v2 \
+    --wandb_experiment_name tis-giga-tversky-structured-v3 \
     --checkpoint_every_epoch \
     --gradient_clip_val 1.0 \
     --log_every_n_steps 50

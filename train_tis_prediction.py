@@ -18,7 +18,7 @@ from rinalmo.data.downstream.tis_prediction.datamodule import TISDataModule
 from rinalmo.model.model import RiNALMo
 from rinalmo.model.downstream import TISPredictionHead
 from rinalmo.config import model_config
-from rinalmo.utils.tis_loss import TISAwareFocalLoss
+from rinalmo.utils.tis_loss import CompoundTISLoss
 from rinalmo.utils.tis_metrics import tis_binary_metrics, aggregate_tis_metrics
 
 PRED_HEAD_EMBED_DIM = 128
@@ -38,10 +38,9 @@ class TISPredictionWrapper(pl.LightningModule):
         lr: float = 1e-5,
         weight_decay: float = 0.01,
         # Loss hyper-parameters
-        focal_gamma: float = 2.0,
-        pos_weight: float = 10.0,
-        non_atg_tis_bonus: float = 5.0,
-        atg_neg_weight: float = 2.0,
+        tversky_alpha: float = 0.3,
+        tversky_beta: float = 0.7,
+        atg_lambda: float = 1.0,
     ) -> None:
         super().__init__()
 
@@ -56,11 +55,10 @@ class TISPredictionWrapper(pl.LightningModule):
             dropout=head_dropout,
         )
 
-        self.loss_fn = TISAwareFocalLoss(
-            gamma=focal_gamma,
-            pos_weight=pos_weight,
-            non_atg_tis_bonus=non_atg_tis_bonus,
-            atg_neg_weight=atg_neg_weight,
+        self.loss_fn = CompoundTISLoss(
+            tversky_alpha=tversky_alpha,
+            tversky_beta=tversky_beta,
+            atg_lambda=atg_lambda,
         )
         self.lr = lr
         self.weight_decay = weight_decay
@@ -175,10 +173,9 @@ def main(args):
         finetune_lm=args.finetune_lm,
         lr=args.lr,
         weight_decay=args.weight_decay,
-        focal_gamma=args.focal_gamma,
-        pos_weight=args.pos_weight,
-        non_atg_tis_bonus=args.non_atg_tis_bonus,
-        atg_neg_weight=args.atg_neg_weight,
+        tversky_alpha=args.tversky_alpha,
+        tversky_beta=args.tversky_beta,
+        atg_lambda=args.atg_lambda,
     )
 
     if args.pretrained_rinalmo_weights:
@@ -197,6 +194,8 @@ def main(args):
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
+        pos_frac=args.pos_frac,
+        hard_frac=args.hard_frac,
     )
 
     # ---- Callbacks & loggers ---------------------------------------------
@@ -290,22 +289,28 @@ if __name__ == "__main__":
         help="Unfreeze the pretrained RiNALMo LM and fine-tune it (default: frozen, head-only training)",
     )
 
-    # --- Loss hyper-parameters --------------------------------------------
+    # --- Loss hyper-parameters (CompoundTISLoss: Tversky + ATG-contrastive) -
     parser.add_argument(
-        "--focal_gamma", type=float, default=0.5,
-        help="Focal loss gamma (focusing parameter; lower = less suppression of rare positives)",
+        "--tversky_alpha", type=float, default=0.3,
+        help="False-positive weight in Tversky denominator (lower → tolerate more FP)",
     )
     parser.add_argument(
-        "--pos_weight", type=float, default=50.0,
-        help="Weight for positive (TIS) class to handle token-level imbalance",
+        "--tversky_beta", type=float, default=0.7,
+        help="False-negative weight in Tversky denominator (higher → recall bias)",
     )
     parser.add_argument(
-        "--non_atg_tis_bonus", type=float, default=5.0,
-        help="Extra multiplier for non-ATG TIS sites",
+        "--atg_lambda", type=float, default=1.0,
+        help="Mixing coefficient for the ATG-contrastive BCE term",
+    )
+
+    # --- Structured batch sampling ----------------------------------------
+    parser.add_argument(
+        "--pos_frac", type=float, default=0.5,
+        help="Fraction of each batch that should be positive (TIS-containing) windows",
     )
     parser.add_argument(
-        "--atg_neg_weight", type=float, default=2.0,
-        help="Weight for ATG positions that are NOT TIS (hard negatives)",
+        "--hard_frac", type=float, default=0.3,
+        help="Fraction of each batch that should be hard negatives (ATG, no TIS)",
     )
 
     # --- Data -------------------------------------------------------------
