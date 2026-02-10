@@ -172,3 +172,31 @@ class SpliceSitePredictionHead(nn.Module):
     def forward(self, x):
         x = self.classifier(x)
         return x
+
+
+class TISPredictionHead(nn.Module):
+    """Token-level binary classifier for Translation Initiation Site prediction.
+
+    Uses 1D ResNet blocks to capture local sequence context (e.g. Kozak consensus),
+    then projects each token position to a single logit.
+    """
+    def __init__(self, c_in, embed_dim, num_blocks=2, kernel_size=9, dropout=0.1):
+        super().__init__()
+
+        self.linear_in = nn.Linear(c_in, embed_dim)
+        self.resnet = ResNet1D(embed_dim, num_blocks, kernel_size)
+        self.dropout = nn.Dropout(p=dropout)
+        self.linear_out = nn.Linear(embed_dim, 1)
+
+    def forward(self, x, padding_mask=None):
+        # x: B x L x E (per-token representations)
+        x = self.linear_in(x)
+
+        x = x.permute(0, 2, 1) # B x L x E => B x E x L
+        x = self.resnet(x)
+        x = x.permute(0, 2, 1) # B x E x L => B x L x E
+
+        x = self.dropout(x)
+        x = self.linear_out(x).squeeze(-1) # B x L
+
+        return x
