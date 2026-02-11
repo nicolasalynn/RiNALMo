@@ -90,10 +90,10 @@ class TISPredictionWrapper(pl.LightningModule):
     # Training
     # ------------------------------------------------------------------
     def training_step(self, batch, batch_idx):
-        tokens, labels, atg_mask, ignore_mask = batch
+        tokens, labels, atg_mask, target_mask = batch
         logits = self(tokens)
 
-        loss = self.loss_fn(logits, labels, atg_mask, ignore_mask)
+        loss = self.loss_fn(logits, labels, atg_mask, target_mask)
 
         self.log("train/loss", loss, sync_dist=True, prog_bar=True)
         return loss
@@ -102,11 +102,11 @@ class TISPredictionWrapper(pl.LightningModule):
     # Validation / Test (shared logic)
     # ------------------------------------------------------------------
     def _eval_step(self, batch, log_prefix: str):
-        tokens, labels, atg_mask, ignore_mask = batch
+        tokens, labels, atg_mask, target_mask = batch
         logits = self(tokens)
 
-        loss = self.loss_fn(logits, labels, atg_mask, ignore_mask)
-        metrics = tis_binary_metrics(logits, labels, atg_mask, ignore_mask)
+        loss = self.loss_fn(logits, labels, atg_mask, target_mask)
+        metrics = tis_binary_metrics(logits, labels, atg_mask, target_mask)
 
         self.val_step_outputs.append(metrics)
         self.log(f"{log_prefix}/loss", loss, sync_dist=True, prog_bar=True)
@@ -191,11 +191,10 @@ def main(args):
         test_data_root=args.test_data_dir,
         alphabet=alphabet,
         max_seq_len=args.max_seq_len,
+        target_block_size=args.target_block_size,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
-        pos_frac=args.pos_frac,
-        hard_frac=args.hard_frac,
     )
 
     # ---- Callbacks & loggers ---------------------------------------------
@@ -303,14 +302,11 @@ if __name__ == "__main__":
         help="Mixing coefficient for the ATG-contrastive BCE term",
     )
 
-    # --- Structured batch sampling ----------------------------------------
+    # --- Window geometry ---------------------------------------------------
     parser.add_argument(
-        "--pos_frac", type=float, default=0.5,
-        help="Fraction of each batch that should be positive (TIS-containing) windows",
-    )
-    parser.add_argument(
-        "--hard_frac", type=float, default=0.3,
-        help="Fraction of each batch that should be hard negatives (ATG, no TIS)",
+        "--target_block_size", type=int, default=400,
+        help="Size of the central target block (nt) where loss is computed. "
+             "Flanking context fills the remainder of max_seq_len.",
     )
 
     # --- Data -------------------------------------------------------------

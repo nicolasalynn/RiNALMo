@@ -8,7 +8,6 @@ from pathlib import Path
 from rinalmo.data.alphabet import Alphabet
 from rinalmo.data.downstream.tis_prediction.dataset import (
     TISDataset,
-    StructuredTISBatchSampler,
     tis_collate_fn,
 )
 
@@ -27,9 +26,9 @@ class TISDataModule(pl.LightningDataModule):
     Each CSV must have columns ``sequence`` and ``tis_positions`` (see
     :class:`TISDataset` for format details).
 
-    Training uses :class:`StructuredTISBatchSampler` to construct each
-    batch with a controlled mix of positive windows, hard negatives
-    (ATG-containing, no TIS), and easy negatives.
+    Training data is pre-filtered to contain only windows with at least
+    one TIS site (positive-window mining), so a standard shuffled
+    DataLoader is sufficient — no structured batch sampler needed.
     """
 
     def __init__(
@@ -38,11 +37,10 @@ class TISDataModule(pl.LightningDataModule):
         test_data_root: Optional[Union[Path, str]] = None,
         alphabet: Alphabet = Alphabet(),
         max_seq_len: int = 1022,
+        target_block_size: int = 400,
         batch_size: int = 1,
         num_workers: int = 0,
         pin_memory: bool = False,
-        pos_frac: float = 0.5,
-        hard_frac: float = 0.3,
     ):
         super().__init__()
 
@@ -50,12 +48,11 @@ class TISDataModule(pl.LightningDataModule):
         self.test_data_root = Path(test_data_root) if test_data_root else None
         self.alphabet = alphabet
         self.max_seq_len = max_seq_len
+        self.target_block_size = target_block_size
 
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.pin_memory = pin_memory
-        self.pos_frac = pos_frac
-        self.hard_frac = hard_frac
 
     def setup(self, stage: Optional[str] = None):
         if self.data_root is not None:
@@ -63,11 +60,13 @@ class TISDataModule(pl.LightningDataModule):
                 self.data_root / "train.csv",
                 alphabet=self.alphabet,
                 max_seq_len=self.max_seq_len,
+                target_block_size=self.target_block_size,
             )
             self.val_dataset = TISDataset(
                 self.data_root / "val.csv",
                 alphabet=self.alphabet,
                 max_seq_len=self.max_seq_len,
+                target_block_size=self.target_block_size,
             )
 
         if self.test_data_root is not None:
@@ -75,19 +74,14 @@ class TISDataModule(pl.LightningDataModule):
                 self.test_data_root / "test.csv",
                 alphabet=self.alphabet,
                 max_seq_len=self.max_seq_len,
+                target_block_size=self.target_block_size,
             )
 
     def train_dataloader(self):
-        sampler = StructuredTISBatchSampler(
-            dataset=self.train_dataset,
-            batch_size=self.batch_size,
-            pos_frac=self.pos_frac,
-            hard_frac=self.hard_frac,
-        )
-
         return DataLoader(
             self.train_dataset,
-            batch_sampler=sampler,
+            batch_size=self.batch_size,
+            shuffle=True,
             num_workers=self.num_workers,
             pin_memory=self.pin_memory,
             collate_fn=tis_collate_fn,

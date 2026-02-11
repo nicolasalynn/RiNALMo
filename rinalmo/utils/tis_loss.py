@@ -44,29 +44,24 @@ class CompoundTISLoss(nn.Module):
         logits: torch.Tensor,
         labels: torch.Tensor,
         atg_mask: torch.Tensor,
-        ignore_mask: torch.Tensor | None = None,
+        target_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
             logits:      (B, L) raw logits per position.
             labels:      (B, L) binary targets.
             atg_mask:    (B, L) bool — True where ATG codon begins.
-            ignore_mask: (B, L) bool — True for CLS / EOS / PAD.
+            target_mask: (B, L) bool — True for target-block positions
+                         (where loss should be computed).
 
         Returns:
             Scalar loss.
         """
         probs = torch.sigmoid(logits)
 
-        # Build valid mask
-        if ignore_mask is not None:
-            valid = ~ignore_mask
-        else:
-            valid = torch.ones_like(labels, dtype=torch.bool)
-
-        # ---- Tversky loss (on all valid positions) -----------------------
-        p = probs[valid]
-        t = labels[valid]
+        # ---- Tversky loss (on target positions only) ---------------------
+        p = probs[target_mask]
+        t = labels[target_mask]
 
         tp = (p * t).sum()
         fp = (p * (1.0 - t)).sum()
@@ -77,8 +72,8 @@ class CompoundTISLoss(nn.Module):
         )
         tversky_loss = 1.0 - tversky_index
 
-        # ---- ATG-contrastive BCE (only on ATG positions) -----------------
-        atg_valid = valid & atg_mask
+        # ---- ATG-contrastive BCE (only on ATG positions in target) --------
+        atg_valid = target_mask & atg_mask
         if atg_valid.any():
             atg_logits = logits[atg_valid]
             atg_labels = labels[atg_valid]

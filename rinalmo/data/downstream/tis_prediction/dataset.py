@@ -1,57 +1,47 @@
 import torch
-from torch.utils.data import Dataset, Sampler
+from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
 import pandas as pd
-import random
-import math
 
 from typing import Union, List, Tuple, Optional
 from pathlib import Path
 
 from rinalmo.data.alphabet import Alphabet
 
-# Window categories for structured batch construction
-CAT_POSITIVE = 0   # Contains at least one TIS site
-CAT_HARD_NEG = 1   # No TIS, but contains ATG codons (confounders)
-CAT_EASY_NEG = 2   # No TIS, no ATG codons
+# Default geometry (must satisfy: target + 2*flank <= max_seq_len)
+DEFAULT_TARGET_BLOCK_SIZE = 400
 
 
 class TISDataset(Dataset):
     """Dataset for Translation Initiation Site prediction.
 
-    Expects a CSV with columns:
-        - sequence:      The mRNA/RNA nucleotide sequence.
-        - tis_positions: Semicolon-separated 0-based positions in the sequence
-                         that are annotated translation initiation sites.
-                         Empty or "nan" means no TIS in this sequence.
+    Implements the SpliceAI-style "positive-window mining" strategy:
 
-    An optional ``transcript_id`` column is ignored during training but kept
-    in the DataFrame for traceability.
+    1. **Tile** each transcript into non-overlapping target blocks of
+       ``target_block_size`` nucleotides.
+    2. **Discard** any block that contains zero annotated TIS positions.
+    3. **Expand** each surviving block with symmetric flanking context so
+       the total window length equals ``max_seq_len``.  The flanking
+       nucleotides provide upstream/downstream context (e.g. Kozak motifs,
+       UTR structure) but are excluded from loss computation.
+    4. For short transcripts (≤ ``max_seq_len``), the full sequence is
+       used as a single sample and the entire sequence is the target.
 
-    Windowing
-    ---------
-    Because RiNALMo was pre-trained on sequences up to ~1022 nt (1024 tokens
-    with CLS/EOS), longer transcripts are split into windows at dataset-
-    construction time.
-
-    Each window is categorised as:
-      - **positive**: contains at least one annotated TIS site
-      - **hard_neg**: no TIS but contains ATG codons (the confounders the
-        model must learn to reject)
-      - **easy_neg**: no TIS and no ATG codons
-
-    These categories enable structured batch construction via
-    :class:`StructuredTISBatchSampler`.
+    This eliminates extreme class imbalance at the dataset level: every
+    training window is guaranteed to contain at least one TIS, so a
+    simple shuffled DataLoader is sufficient — no structured batch
+    sampler required.
 
     Each sample returns:
         tokens:      (L,) int64   — tokenised window (with CLS / EOS).
         labels:      (L,) float32 — 1.0 at TIS positions, 0.0 elsewhere.
         atg_mask:    (L,) bool    — True where an ATG codon begins.
-        ignore_mask: (L,) bool    — True for CLS, EOS, PAD (loss-excluded).
+        target_mask: (L,) bool    — True for positions in the target block
+                                    (where loss should be computed).  False
+                                    for CLS, EOS, PAD, and flanking context.
     """
 
-    # Token characters for ATG detection (alphabet maps U→T internally)
     _A = "A"
     _T = "T"
     _G = "G"
@@ -61,38 +51,25 @@ class TISDataset(Dataset):
         csv_path: Union[str, Path],
         alphabet: Alphabet,
         max_seq_len: int = 1022,
-        neg_window_stride: Optional[int] = None,
+        target_block_size: int = DEFAULT_TARGET_BLOCK_SIZE,
     ):
         super().__init__()
 
         self.alphabet = alphabet
         self.max_seq_len = max_seq_len if max_seq_len else None
-        self.neg_window_stride = neg_window_stride or (
-            max_seq_len // 2 if max_seq_len else None
-        )
+        self.target_block_size = target_block_size
 
         # Pre-resolve token indices for ATG detection
         self._a_idx = alphabet.get_idx(self._A)
         self._t_idx = alphabet.get_idx(self._T)
         self._g_idx = alphabet.get_idx(self._G)
 
-        # Read CSV and pre-compute windows
+        # Read CSV and build windows
         df = pd.read_csv(csv_path)
-        self.samples: List[Tuple[str, List[int]]] = []
-        self.categories: List[int] = []  # CAT_POSITIVE / CAT_HARD_NEG / CAT_EASY_NEG
+        # Each sample: (subsequence, tis_positions_local, target_start, target_end)
+        # target_start/end are in *sequence-local* coordinates (0-based, before CLS offset)
+        self.samples: List[Tuple[str, List[int], int, int]] = []
         self._build_samples(df)
-
-        # Build per-category index lists for the structured sampler
-        self.positive_indices: List[int] = []
-        self.hard_neg_indices: List[int] = []
-        self.easy_neg_indices: List[int] = []
-        for i, cat in enumerate(self.categories):
-            if cat == CAT_POSITIVE:
-                self.positive_indices.append(i)
-            elif cat == CAT_HARD_NEG:
-                self.hard_neg_indices.append(i)
-            else:
-                self.easy_neg_indices.append(i)
 
     # ------------------------------------------------------------------
     # Window construction
@@ -103,69 +80,67 @@ class TISDataset(Dataset):
             return [int(p) for p in raw.split(";") if p.strip()]
         return []
 
-    def _seq_has_atg(self, seq: str) -> bool:
-        """Check if a nucleotide string contains an ATG triplet."""
-        return "ATG" in seq.upper().replace("U", "T")
-
-    def _clamp_window(self, centre: int, seq_len: int) -> Tuple[int, int]:
-        half = self.max_seq_len // 2
-        start = max(0, centre - half)
-        end = start + self.max_seq_len
-        if end > seq_len:
-            end = seq_len
-            start = max(0, end - self.max_seq_len)
-        return start, end
-
-    def _categorise(self, seq: str, tis_positions: List[int]) -> int:
-        if len(tis_positions) > 0:
-            return CAT_POSITIVE
-        elif self._seq_has_atg(seq):
-            return CAT_HARD_NEG
-        else:
-            return CAT_EASY_NEG
-
     def _build_samples(self, df: pd.DataFrame):
         for _, row in df.iterrows():
             seq = str(row["sequence"])
             tis_positions = self._parse_tis(row["tis_positions"])
             seq_len = len(seq)
 
+            # Short transcript: fits entirely in one window
             if self.max_seq_len is None or seq_len <= self.max_seq_len:
-                self.samples.append((seq, tis_positions))
-                self.categories.append(self._categorise(seq, tis_positions))
+                if len(tis_positions) > 0:
+                    self.samples.append((seq, tis_positions, 0, seq_len))
                 continue
 
-            # --- Windowing for long sequences ----------------------------------
-            windows_used: List[Tuple[int, int]] = []
+            # --- Long transcript: tile into target blocks ---------------------
+            target_size = self.target_block_size
+            flank = (self.max_seq_len - target_size) // 2
 
-            for pos in tis_positions:
-                start, end = self._clamp_window(pos, seq_len)
-                windows_used.append((start, end))
+            for block_start in range(0, seq_len, target_size):
+                block_end = min(block_start + target_size, seq_len)
 
-            stride = self.neg_window_stride
-            start = 0
-            while start < seq_len:
-                end = min(start + self.max_seq_len, seq_len)
-                if not any(ws == start and we == end for ws, we in windows_used):
-                    windows_used.append((start, end))
-                start += stride
-                if end == seq_len:
-                    break
-
-            seen = set()
-            for w_start, w_end in windows_used:
-                if (w_start, w_end) in seen:
+                # Only keep blocks that contain at least one TIS
+                block_tis = [p for p in tis_positions if block_start <= p < block_end]
+                if not block_tis:
                     continue
-                seen.add((w_start, w_end))
 
-                subseq = seq[w_start:w_end]
+                # Expand with flanking context
+                window_start = max(0, block_start - flank)
+                window_end = min(seq_len, block_end + flank)
+
+                # If near an edge, try to fill the full max_seq_len
+                window_len = window_end - window_start
+                if window_len < self.max_seq_len:
+                    deficit = self.max_seq_len - window_len
+                    # Try expanding left first
+                    if window_start > 0:
+                        expand = min(deficit, window_start)
+                        window_start -= expand
+                        deficit -= expand
+                    # Then right
+                    if deficit > 0 and window_end < seq_len:
+                        window_end = min(seq_len, window_end + deficit)
+
+                # Clamp window to max_seq_len
+                if window_end - window_start > self.max_seq_len:
+                    window_end = window_start + self.max_seq_len
+
+                subseq = seq[window_start:window_end]
+
+                # Remap ALL TIS positions that fall within the window
+                # (not just block_tis — a TIS in the flank still needs a label
+                #  even though it won't contribute to loss via target_mask)
                 sub_tis = [
-                    p - w_start
+                    p - window_start
                     for p in tis_positions
-                    if w_start <= p < w_end
+                    if window_start <= p < window_end
                 ]
-                self.samples.append((subseq, sub_tis))
-                self.categories.append(self._categorise(subseq, sub_tis))
+
+                # Target region in window-local coordinates
+                target_start_local = block_start - window_start
+                target_end_local = block_end - window_start
+
+                self.samples.append((subseq, sub_tis, target_start_local, target_end_local))
 
     # ------------------------------------------------------------------
     # __getitem__
@@ -174,14 +149,14 @@ class TISDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        seq, tis_positions = self.samples[idx]
+        seq, tis_positions, target_start, target_end = self.samples[idx]
 
         tokens = torch.tensor(self.alphabet.encode(seq), dtype=torch.long)
         tok_len = len(tokens)
 
         labels = torch.zeros(tok_len, dtype=torch.float32)
         for pos in tis_positions:
-            labels[pos + 1] = 1.0
+            labels[pos + 1] = 1.0  # +1 for CLS
 
         atg_mask = torch.zeros(tok_len, dtype=torch.bool)
         for i in range(1, tok_len - 2):
@@ -192,89 +167,12 @@ class TISDataset(Dataset):
             ):
                 atg_mask[i] = True
 
-        ignore_mask = torch.zeros(tok_len, dtype=torch.bool)
-        ignore_mask[0] = True
-        ignore_mask[len(seq) + 1] = True
+        # Target mask: True only for positions in the target block
+        # +1 offset because tokens[0] = CLS
+        target_mask = torch.zeros(tok_len, dtype=torch.bool)
+        target_mask[target_start + 1 : target_end + 1] = True
 
-        return tokens, labels, atg_mask, ignore_mask
-
-
-# ======================================================================
-# Structured batch sampler
-# ======================================================================
-class StructuredTISBatchSampler(Sampler):
-    """Constructs batches with a controlled mix of window categories.
-
-    Each batch of size B contains:
-      - ``pos_frac * B``  positive windows  (TIS-containing)
-      - ``hard_frac * B`` hard negatives     (ATG but no TIS)
-      - remainder         easy negatives     (no ATG, no TIS)
-
-    Within each category, samples are drawn randomly without replacement
-    until the pool is exhausted, then reshuffled (infinite epoch).
-    This means the model sees each positive window roughly the same number
-    of times per epoch, but batches are always balanced.
-
-    Args:
-        dataset:   A TISDataset instance.
-        batch_size: Samples per batch.
-        pos_frac:  Fraction of batch that should be positive windows.
-        hard_frac: Fraction of batch that should be hard negatives.
-        epoch_len: Number of batches per epoch.  Defaults to
-                   ``len(dataset) // batch_size``.
-    """
-
-    def __init__(
-        self,
-        dataset: TISDataset,
-        batch_size: int,
-        pos_frac: float = 0.5,
-        hard_frac: float = 0.3,
-        epoch_len: Optional[int] = None,
-    ):
-        self.batch_size = batch_size
-        self.pos_frac = pos_frac
-        self.hard_frac = hard_frac
-        self.epoch_len = epoch_len or (len(dataset) // batch_size)
-
-        self._pos = list(dataset.positive_indices)
-        self._hard = list(dataset.hard_neg_indices)
-        self._easy = list(dataset.easy_neg_indices)
-
-        # Fallback: if a category is empty, redistribute to others
-        if not self._hard:
-            self._hard = self._easy
-        if not self._easy:
-            self._easy = self._hard
-
-    def _infinite_shuffle(self, pool: List[int]):
-        """Yield indices from *pool* forever, reshuffling each pass."""
-        buf = []
-        while True:
-            if not buf:
-                buf = pool.copy()
-                random.shuffle(buf)
-            yield buf.pop()
-
-    def __iter__(self):
-        n_pos = max(1, round(self.batch_size * self.pos_frac))
-        n_hard = max(1, round(self.batch_size * self.hard_frac))
-        n_easy = self.batch_size - n_pos - n_hard
-
-        pos_gen = self._infinite_shuffle(self._pos)
-        hard_gen = self._infinite_shuffle(self._hard)
-        easy_gen = self._infinite_shuffle(self._easy)
-
-        for _ in range(self.epoch_len):
-            batch = []
-            batch.extend(next(pos_gen) for _ in range(n_pos))
-            batch.extend(next(hard_gen) for _ in range(n_hard))
-            batch.extend(next(easy_gen) for _ in range(n_easy))
-            random.shuffle(batch)
-            yield batch
-
-    def __len__(self):
-        return self.epoch_len
+        return tokens, labels, atg_mask, target_mask
 
 
 # ======================================================================
@@ -282,13 +180,13 @@ class StructuredTISBatchSampler(Sampler):
 # ======================================================================
 def tis_collate_fn(batch):
     """Collate variable-length TIS samples into a padded batch."""
-    tokens_list, labels_list, atg_list, ignore_list = zip(*batch)
+    tokens_list, labels_list, atg_list, target_list = zip(*batch)
 
     pad_idx = 1  # Alphabet.pad_idx
 
     tokens = pad_sequence(tokens_list, batch_first=True, padding_value=pad_idx)
     labels = pad_sequence(labels_list, batch_first=True, padding_value=0.0)
     atg_mask = pad_sequence(atg_list, batch_first=True, padding_value=False)
-    ignore_mask = pad_sequence(ignore_list, batch_first=True, padding_value=True)
+    target_mask = pad_sequence(target_list, batch_first=True, padding_value=False)
 
-    return tokens, labels, atg_mask, ignore_mask
+    return tokens, labels, atg_mask, target_mask

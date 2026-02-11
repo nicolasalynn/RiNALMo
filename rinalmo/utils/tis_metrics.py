@@ -5,7 +5,7 @@ def tis_binary_metrics(
     logits: torch.Tensor,
     labels: torch.Tensor,
     atg_mask: torch.Tensor,
-    ignore_mask: torch.Tensor | None = None,
+    target_mask: torch.Tensor,
     threshold: float = 0.5,
 ):
     """Compute TIS prediction metrics including ATG-awareness diagnostics.
@@ -14,7 +14,7 @@ def tis_binary_metrics(
         logits:      (B, L) raw logits.
         labels:      (B, L) binary ground truth.
         atg_mask:    (B, L) bool — True where ATG codon begins.
-        ignore_mask: (B, L) bool — True for positions to exclude (CLS/EOS/PAD).
+        target_mask: (B, L) bool — True for target-block positions.
         threshold:   Decision threshold on sigmoid(logits).
 
     Returns:
@@ -26,15 +26,9 @@ def tis_binary_metrics(
     """
     preds = (torch.sigmoid(logits) >= threshold).float()
 
-    # Build valid mask (True = include)
-    if ignore_mask is not None:
-        valid = ~ignore_mask
-    else:
-        valid = torch.ones_like(labels, dtype=torch.bool)
-
-    p = preds[valid]
-    l = labels[valid]
-    atg = atg_mask[valid]
+    p = preds[target_mask]
+    l = labels[target_mask]
+    atg = atg_mask[target_mask]
 
     tp = ((p == 1) & (l == 1)).sum()
     fp = ((p == 1) & (l == 0)).sum()
