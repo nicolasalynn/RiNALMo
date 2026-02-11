@@ -28,3 +28,29 @@ python train_tis_prediction.py \
     --checkpoint_every_epoch \
     --gradient_clip_val 1.0 \
     --log_every_n_steps 50
+
+# --- Standalone dilated-conv architecture (no pretrained LM) ---
+# python train_tis_prediction.py \
+#     --architecture dilated_conv \
+#     --data_dir ./data/tis_prediction \
+#     --output_dir ./outputs/tis_dilated \
+#     --max_seq_len 1022 \
+#     --target_block_size 400 \
+#     --batch_size 32 \
+#     --max_epochs 50 \
+#     --lr 3e-4 \
+#     --seed 42 \
+#     --num_workers 4 \
+#     --pin_memory \
+#     --conv_channels 256 \
+#     --conv_kernel_size 9 \
+#     --conv_dilations 1 2 4 8 16 32 64 128 \
+#     --conv_dropout 0.1 \
+#     --num_transformer_layers 2 \
+#     --transformer_heads 8 \
+#     --wandb \
+#     --wandb_project rinalmo-tis \
+#     --wandb_experiment_name tis-dilated-conv-v1 \
+#     --checkpoint_every_epoch \
+#     --gradient_clip_val 1.0 \
+#     --log_every_n_steps 50

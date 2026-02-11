@@ -17,6 +17,7 @@ from rinalmo.data.alphabet import Alphabet
 from rinalmo.data.downstream.tis_prediction.datamodule import TISDataModule
 from rinalmo.model.model import RiNALMo
 from rinalmo.model.downstream import TISPredictionHead
+from rinalmo.model.dilated_conv import DilatedConvTISModel
 from rinalmo.config import model_config
 from rinalmo.utils.tis_loss import CompoundTISLoss
 from rinalmo.utils.tis_metrics import tis_binary_metrics, aggregate_tis_metrics
@@ -29,6 +30,7 @@ PRED_HEAD_KERNEL_SIZE = 9
 class TISPredictionWrapper(pl.LightningModule):
     def __init__(
         self,
+        architecture: str = "rinalmo",
         lm_config: str = "giga",
         head_embed_dim: int = PRED_HEAD_EMBED_DIM,
         head_num_blocks: int = PRED_HEAD_NUM_BLOCKS,
@@ -41,19 +43,42 @@ class TISPredictionWrapper(pl.LightningModule):
         tversky_alpha: float = 0.3,
         tversky_beta: float = 0.7,
         atg_lambda: float = 1.0,
+        # Dilated-conv architecture hyper-parameters
+        conv_channels: int = 256,
+        conv_kernel_size: int = 9,
+        conv_dilations: list = None,
+        conv_dropout: float = 0.1,
+        num_transformer_layers: int = 2,
+        transformer_heads: int = 8,
     ) -> None:
         super().__init__()
 
         self.save_hyperparameters()
+        self.architecture = architecture
 
-        self.rinalmo = RiNALMo(model_config(lm_config))
-        self.pred_head = TISPredictionHead(
-            c_in=self.rinalmo.config["model"]["transformer"].embed_dim,
-            embed_dim=head_embed_dim,
-            num_blocks=head_num_blocks,
-            kernel_size=head_kernel_size,
-            dropout=head_dropout,
-        )
+        if architecture == "dilated_conv":
+            self.model = DilatedConvTISModel(
+                conv_channels=conv_channels,
+                kernel_size=conv_kernel_size,
+                dilations=conv_dilations,
+                dropout=conv_dropout,
+                num_transformer_layers=num_transformer_layers,
+                transformer_heads=transformer_heads,
+            )
+        else:
+            self.rinalmo = RiNALMo(model_config(lm_config))
+            self.pred_head = TISPredictionHead(
+                c_in=self.rinalmo.config["model"]["transformer"].embed_dim,
+                embed_dim=head_embed_dim,
+                num_blocks=head_num_blocks,
+                kernel_size=head_kernel_size,
+                dropout=head_dropout,
+            )
+            self.finetune_lm = finetune_lm
+            # Freeze the pretrained LM by default — only train the head
+            if not finetune_lm:
+                for param in self.rinalmo.parameters():
+                    param.requires_grad = False
 
         self.loss_fn = CompoundTISLoss(
             tversky_alpha=tversky_alpha,
@@ -62,20 +87,19 @@ class TISPredictionWrapper(pl.LightningModule):
         )
         self.lr = lr
         self.weight_decay = weight_decay
-        self.finetune_lm = finetune_lm
-
-        # Freeze the pretrained LM by default — only train the head
-        if not finetune_lm:
-            for param in self.rinalmo.parameters():
-                param.requires_grad = False
 
         self.val_step_outputs = []
 
     def load_pretrained_rinalmo_weights(self, pretrained_weights_path):
+        if self.architecture == "dilated_conv":
+            return  # No pretrained LM to load for standalone model
         self.rinalmo.load_state_dict(torch.load(pretrained_weights_path), strict=False)
 
     def forward(self, tokens):
-        # When LM is frozen, run it in no_grad to save memory
+        if self.architecture == "dilated_conv":
+            return self.model(tokens)  # B x L
+
+        # RiNALMo path: when LM is frozen, run it in no_grad to save memory
         if not self.finetune_lm:
             with torch.no_grad():
                 representation = self.rinalmo(tokens)["representation"]  # B x L x E
@@ -142,12 +166,14 @@ class TISPredictionWrapper(pl.LightningModule):
     # Optimiser
     # ------------------------------------------------------------------
     def configure_optimizers(self):
-        param_groups = [{"params": self.pred_head.parameters()}]
-
-        if self.finetune_lm:
-            param_groups.append(
-                {"params": self.rinalmo.transformer.parameters(), "lr": self.lr * 0.1}
-            )
+        if self.architecture == "dilated_conv":
+            param_groups = [{"params": self.model.parameters()}]
+        else:
+            param_groups = [{"params": self.pred_head.parameters()}]
+            if self.finetune_lm:
+                param_groups.append(
+                    {"params": self.rinalmo.transformer.parameters(), "lr": self.lr * 0.1}
+                )
 
         optimizer = AdamW(param_groups, lr=self.lr, weight_decay=self.weight_decay)
         return {"optimizer": optimizer}
@@ -165,6 +191,7 @@ def main(args):
 
     # ---- Model -----------------------------------------------------------
     model = TISPredictionWrapper(
+        architecture=args.architecture,
         lm_config=args.lm_config,
         head_embed_dim=args.head_embed_dim,
         head_num_blocks=args.head_num_blocks,
@@ -176,6 +203,12 @@ def main(args):
         tversky_alpha=args.tversky_alpha,
         tversky_beta=args.tversky_beta,
         atg_lambda=args.atg_lambda,
+        conv_channels=args.conv_channels,
+        conv_kernel_size=args.conv_kernel_size,
+        conv_dilations=args.conv_dilations,
+        conv_dropout=args.conv_dropout,
+        num_transformer_layers=args.num_transformer_layers,
+        transformer_heads=args.transformer_heads,
     )
 
     if args.pretrained_rinalmo_weights:
@@ -278,7 +311,14 @@ if __name__ == "__main__":
         help="Path to .pt file with full wrapper weights to resume from",
     )
 
-    # --- Prediction head --------------------------------------------------
+    # --- Architecture selection --------------------------------------------
+    parser.add_argument(
+        "--architecture", type=str, default="rinalmo",
+        choices=["rinalmo", "dilated_conv"],
+        help="Model architecture: 'rinalmo' (pretrained LM + head) or 'dilated_conv' (standalone SpliceAI-style)",
+    )
+
+    # --- Prediction head (rinalmo architecture) ---------------------------
     parser.add_argument("--head_embed_dim", type=int, default=PRED_HEAD_EMBED_DIM)
     parser.add_argument("--head_num_blocks", type=int, default=PRED_HEAD_NUM_BLOCKS)
     parser.add_argument("--head_kernel_size", type=int, default=PRED_HEAD_KERNEL_SIZE)
@@ -287,6 +327,14 @@ if __name__ == "__main__":
         "--finetune_lm", action="store_true", default=False,
         help="Unfreeze the pretrained RiNALMo LM and fine-tune it (default: frozen, head-only training)",
     )
+
+    # --- Dilated-conv architecture hyper-parameters -----------------------
+    parser.add_argument("--conv_channels", type=int, default=256)
+    parser.add_argument("--conv_kernel_size", type=int, default=9)
+    parser.add_argument("--conv_dilations", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 64, 128])
+    parser.add_argument("--conv_dropout", type=float, default=0.1)
+    parser.add_argument("--num_transformer_layers", type=int, default=2)
+    parser.add_argument("--transformer_heads", type=int, default=8)
 
     # --- Loss hyper-parameters (CompoundTISLoss: Tversky + ATG-contrastive) -
     parser.add_argument(
