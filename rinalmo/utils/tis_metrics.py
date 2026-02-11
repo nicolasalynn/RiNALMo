@@ -102,3 +102,34 @@ def aggregate_tis_metrics(accumulated: dict) -> dict:
         "atg_tis_recall": atg_tis_recall,
         "atg_specificity": atg_specificity,
     }
+
+
+def tis_topk_precision(
+    all_scores: torch.Tensor,
+    all_labels: torch.Tensor,
+    k_values: list = None,
+) -> dict:
+    """Precision@k: of the top-k highest-scoring positions, how many are true TIS?
+
+    Args:
+        all_scores: (N,) sigmoid scores for all target-masked positions across the epoch.
+        all_labels: (N,) binary labels for the same positions.
+        k_values:   list of k values to evaluate.
+
+    Returns:
+        dict mapping "topk_precision@{k}" to percentage values.
+    """
+    if k_values is None:
+        k_values = [10, 50, 100, 500]
+
+    n = all_scores.shape[0]
+    results = {}
+
+    for k in k_values:
+        if k > n:
+            continue
+        _, topk_idx = torch.topk(all_scores, k)
+        hits = all_labels[topk_idx].sum().float()
+        results[f"topk_precision@{k}"] = (hits / k * 100).item()
+
+    return results

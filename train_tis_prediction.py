@@ -20,7 +20,7 @@ from rinalmo.model.downstream import TISPredictionHead
 from rinalmo.model.dilated_conv import DilatedConvTISModel
 from rinalmo.config import model_config
 from rinalmo.utils.tis_loss import CompoundTISLoss
-from rinalmo.utils.tis_metrics import tis_binary_metrics, aggregate_tis_metrics
+from rinalmo.utils.tis_metrics import tis_binary_metrics, aggregate_tis_metrics, tis_topk_precision
 
 PRED_HEAD_EMBED_DIM = 128
 PRED_HEAD_NUM_BLOCKS = 2
@@ -132,18 +132,32 @@ class TISPredictionWrapper(pl.LightningModule):
         loss = self.loss_fn(logits, labels, atg_mask, target_mask)
         metrics = tis_binary_metrics(logits, labels, atg_mask, target_mask)
 
-        self.val_step_outputs.append(metrics)
+        # Collect per-position scores & labels (on CPU) for epoch-level top-k
+        scores = torch.sigmoid(logits[target_mask]).detach().cpu()
+        labs = labels[target_mask].detach().cpu()
+
+        self.val_step_outputs.append((metrics, scores, labs))
         self.log(f"{log_prefix}/loss", loss, sync_dist=True, prog_bar=True)
         return loss
 
     def _on_epoch_end(self, log_prefix: str):
         # Accumulate counts across batches
         accumulated = {}
-        for metrics in self.val_step_outputs:
+        all_scores = []
+        all_labels = []
+        for metrics, scores, labs in self.val_step_outputs:
             for k, v in metrics.items():
                 accumulated[k] = accumulated.get(k, torch.tensor(0, device=v.device)) + v
+            all_scores.append(scores)
+            all_labels.append(labs)
 
         agg = aggregate_tis_metrics(accumulated)
+
+        # Top-k precision (computed on CPU from collected scores)
+        all_scores = torch.cat(all_scores)
+        all_labels = torch.cat(all_labels)
+        topk = tis_topk_precision(all_scores, all_labels)
+        agg.update(topk)
 
         log = {f"{log_prefix}/{k}": v for k, v in agg.items()}
         self.log_dict(log, sync_dist=True, add_dataloader_idx=False)
